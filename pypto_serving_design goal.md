@@ -114,6 +114,16 @@
 | Perfetto trace 集成 | 已通过 |
 | 集成测试（8 个用例） | 已通过 |
 
+## Phase 4 实现状态（已完成 — stub 模式）
+
+| 组件 | 状态 |
+|------|------|
+| ChipBackendDlopen（dlopen + stub fallback） | 已完成 |
+| dlopen 框架：自动搜索 libhost_runtime.so | 已完成 |
+| Stub fallback 确定性验证 | 已通过 |
+| 完整 serve pipeline + KV tracking | 已通过 |
+| 注：真实 kernel 集成需要 simpler 硬件环境 | — |
+
 ---
 
 ## 参考文档
