@@ -28,7 +28,7 @@ This run-to-completion model assumes that **function return = task complete**. T
 |---|---|
 | **SDMA** | System DMA — bulk data movement between memory regions |
 | **RoCE** | RDMA over Converged Ethernet — inter-node network data transfer |
-| **UMA** | Unified Memory Access — cross-die or cross-chip memory operations |
+| **URMA** | UB Remote Memory Access — inter-node network data transfer |
 | **CCU** | Cache Coherence Unit — cache management and coherence operations |
 
 When a worker function submits a request to one of these engines and then returns, the hardware engine may still be:
@@ -90,14 +90,14 @@ Four new APIs are introduced, called from within the worker function body:
 #### 2.4.1 Request/Completion Queue Protocol
 
 ```c
-tag = pto2_send_request_entry(RQ_TYPE, RQ_ID, *descriptor);
+tag = pto2_send_request_entry(SQ_TYPE, SQ_ID, *descriptor);
 success = pto2_save_expected_completion(CQ_TYPE, CQ_ID, tag, task_id);
 ```
 
 | Parameter | Description |
 |---|---|
-| `RQ_TYPE` / `CQ_TYPE` | Engine type: `SDMA`, `RoCE`, `UMA`, `CCU`, etc. |
-| `RQ_ID` | Index of the request queue for the given engine type |
+| `SQ_TYPE` / `CQ_TYPE` | Engine type: `SDMA`, `RoCE`, `URMA`, `CCU`, etc. |
+| `SQ_ID` | Index of the request queue for the given engine type |
 | `CQ_ID` | Index of the completion queue for the given engine type |
 | `descriptor` | Engine-specific request descriptor (DMA address, length, etc.) |
 | `tag` | Unique handle returned by `pto2_send_request_entry`, used to match the completion entry |
@@ -303,7 +303,7 @@ This extension introduces a minimal set of additions to the pypto system, spanni
 
 | API | Purpose |
 |---|---|
-| `pto2_send_request_entry(RQ_TYPE, RQ_ID, *descriptor) → tag` | Submit a request to a hardware engine's request queue. Returns a unique `tag` identifying the request. |
+| `pto2_send_request_entry(SQ_TYPE, SQ_ID, *descriptor) → tag` | Submit a request to a hardware engine's request queue. Returns a unique `tag` identifying the request. |
 | `pto2_save_expected_completion(CQ_TYPE, CQ_ID, tag, task_id)` | Register an expected completion queue entry. The scheduler polls the CQ for the matching `tag` and defers task completion until it arrives. |
 | `pto2_send_notification(REMOTE_COUNTER_ADDR, atomic_op)` | Perform a remote atomic operation on a notification counter (e.g., increment a counter on a peer node). |
 | `pto2_save_expected_notification_counter(LOCAL_COUNTER_ADDR, expected_value, task_id)` | Register an expected notification counter value. The scheduler polls the local counter and defers task completion until it reaches the expected value. |
