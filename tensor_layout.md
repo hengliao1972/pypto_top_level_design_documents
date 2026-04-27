@@ -4,7 +4,11 @@
 
 This document specifies an optional `tile_shape` attribute for GM (Global Memory) tensors in pypto. By declaring a `tile_shape`, the programmer instructs the compiler/PTOAS to lay out the tensor in **tile-contiguous** order rather than the default **row-major** order. When the program later issues `TLOAD` / `TSTORE` operations using exactly that tile shape, every transfer becomes a single contiguous burst, maximizing GM bandwidth, NoC bandwidth, and L2 cache efficiency.
 
+> Ruoyu: This "single contiguous burst" claim needs to be qualified against the current PTOAS/A5 DMA model. PTOAS already lowers `TLOAD`/`TSTORE` through hierarchical DMA operations (`copy_gm_to_ubuf`, `copy_ubuf_to_gm`) with hardware loop registers, `n_burst`, `len_burst`, and GM/UB strides. A tile-contiguous GM layout can make the GM source interval contiguous, but it does not by itself guarantee that the generated PTOAS instruction is one flat DMA burst unless the destination UB layout and lowering rule are also defined that way. The proposal should distinguish "physical GM bytes are contiguous" from "PTOAS emits exactly one DMA transaction."
+
 `tile_shape` is purely a **physical layout hint**. The logical `shape` of the tensor, the type system, and program semantics are unchanged.
+
+> Ruoyu: "Hint" is too weak if external memory bytes are actually reordered. This is a physical layout contract between producer, runtime, PTOAS, and consumer. If host code, another kernel, checkpoint/debug code, or peer transfer assumes row-major bytes, correctness can break even though the logical shape is unchanged.
 
 ## 1. Problem Statement
 
@@ -18,6 +22,8 @@ This document specifies an optional `tile_shape` attribute for GM (Global Memory
 Today, when the programmer defines a GM tensor by giving only its `shape`, the compiler defaults to a **row-major** layout: the bytes along the lowest (innermost) dimension are placed consecutively in memory, then the next lowest, and so on.
 
 This default is fine when programs stream along the innermost dimension. It is **catastrophic** when a kernel accesses small 2-D (or higher-rank) tiles that span multiple rows of a wide tensor.
+
+> Ruoyu: The problem statement should also include the already-existing hierarchical blocking alternative: load a larger macro tile into UB/L0-local storage, then use local layout-transform instructions to extract/insert the subtiles needed by compute. This can avoid repeated GM traffic without changing persistent GM layout. The proposal currently frames the issue as if persistent GM tile layout is the only remedy.
 
 ### Concrete Example
 
@@ -51,6 +57,8 @@ Consequences:
 3. **NoC channel underutilization.** The wide pipes are starved by the small request size.
 4. **Longer end-to-end runtime** of `TLOAD` / `TSTORE`, which often sit on the critical path of compute kernels.
 
+> Ruoyu: The example should compare three cases, not two: row-major direct subtile load, tile-contiguous GM layout, and hierarchical load/store where a larger region, for example a 64 KB macro tile, is brought into UB/L0 once and reused via local transforms. If many nearby subtiles are consumed, the hierarchical path can dominate because it amortizes GM traffic while preserving the existing external tensor layout.
+
 ## 2. Solution: Tile-Contiguous Layout via `tile_shape`
 
 We extend the GM tensor definition (typically the output of a `submit` task, or any user-declared GM tensor) with an **optional** `tile_shape` argument:
@@ -63,6 +71,8 @@ T = pl.gm_tensor(
 )
 ```
 
+> Ruoyu: This should be presented as one possible layout mechanism, not the whole solution. The design needs a second, orthogonal concept for execution blocking, such as `macro_tile_shape` or compiler-selected staging: GM -> UB/L0 macro tile -> local subtile extraction/insertion -> compute. Persistent `tile_shape` and hierarchical staging solve different problems and should be designed together.
+
 ### Rules
 
 1. `tile_shape` is **optional**. If omitted, it defaults to `shape`, which reproduces today's row-major behavior — fully backward compatible.
@@ -74,6 +84,8 @@ T = pl.gm_tensor(
    ```
 
    The compiler shall reject definitions that violate this constraint.
+
+> Ruoyu: Tail handling is missing. PTOAS tile buffers already have valid shape/padding concepts, so requiring exact divisibility may be unnecessarily restrictive. The proposal should decide whether boundary tiles are padded, represented with valid-shape metadata, handled by a separate tail path, or rejected. This matters for both direct `TLOAD` and hierarchical macro-tile staging.
 
 ### Memory Layout Definition
 
@@ -102,6 +114,8 @@ GM byte offsets for tile_shape = (16, 16):
 
 A `TLOAD` of a `(16, 16)` tile at tile-grid coordinate `(ti, tj)` is now a **single contiguous 256-byte burst** at offset `(ti * (N/TN) + tj) * 256`, instead of 16 strided 16-byte bursts.
 
+> Ruoyu: The 256-byte example is contiguous in GM, but A5 DMA is still modeled with `n_burst`, `len_burst`, and source/destination strides. If the UB destination tile remains a 2-D row-major tile buffer, PTOAS may still naturally express this as multiple rows unless it intentionally flattens the UB destination. The proposal should specify whether matching `tile_shape` lowers to `(n_burst = 1, len_burst = tile_bytes)` or to a 2-D DMA where GM stride equals row width. The performance claim depends on this lowering rule.
+
 ### Visual Comparison
 
 ```
@@ -128,12 +142,29 @@ The key invariant is:
 
 > If, during the lifetime of the GM tensor, the program **only** accesses it via `TLOAD` / `TSTORE` whose access shape equals the declared `tile_shape` (and is aligned to the tile grid), then **every** transfer becomes a contiguous burst whose length equals `prod(tile_shape) * sizeof(dtype)`.
 
+> Ruoyu: This invariant is too strong for the full system. It should say the GM address interval for the tile is contiguous. Whether the hardware transfer is one burst depends on PTOAS lowering, DMA limits, UB layout, alignment, and whether local layout transforms are inserted. Also, if the tensor is reused at multiple granularities, hierarchical macro-tile staging may be better than forcing the persistent GM layout to the smallest compute tile.
+
 When this invariant holds, tile-contiguous layout delivers:
 
 - **Maximal GM burst length** — the burst length naturally equals the tile byte size, and the programmer chooses `tile_shape` so this matches (or is a multiple of) the platform's preferred burst length (512 B on A2/A3, 128 B on A5).
 - **Maximal NoC efficiency** — wide channels carry full-size transactions instead of being starved by short, strided requests.
 - **L2 cache line utilization → 100 %** — every fetched cache line is fully consumed by the tile.
 - **Fewer outstanding transactions** — reduces controller queue pressure and tail latency.
+
+> Ruoyu: The L2 statement needs alignment and size conditions. For example, a 16x16 FP8 tile is 256 B, while the installed CANN simulator config reports a 512 B cache line for 910B and 950. A single 256 B tile cannot by itself guarantee 100% L2 cache-line utilization unless adjacent data in the same line is also consumed and the tile is cache-line aligned.
+
+### Alternative / Complement: Hierarchical DMA and Local Layout Transforms
+
+> Ruoyu: This proposal should explicitly account for PTOAS's hierarchical memory and layout-transform model. A typical optimized path can be:
+>
+> 1. Use `TLOAD`/DMA to move a larger GM macro tile into UB or another local buffer.
+> 2. Use local transform operations such as `tmov`, `textract`, and `tinsert` to produce the exact compute tile layout needed by each layer.
+> 3. Compute on the local tile layout.
+> 4. Use `tinsert`/`tmov` and `TSTORE`/DMA to assemble and write the result.
+>
+> In this model, every layer can have its own local layout transform design. Persistent GM layout should not be the only place where layout is optimized. The proposal should describe when to prefer persistent `tile_shape` and when to prefer local macro-tile staging.
+>
+> `tmov` is a local tile move or layout conversion between tile domains or memory scopes. `textract` extracts a sub-tile/window from a larger local tile buffer into another tile buffer. `tinsert` is the inverse operation: it inserts a source tile/window into a destination tile buffer at a specified position, so several smaller computed tiles can be assembled into a larger local output tile before store.
 
 ### Caveats: When *not* to specify `tile_shape`
 
@@ -146,6 +177,8 @@ Therefore:
 - When in doubt, omit it — the compiler will fall back to row-major, and correctness is unaffected.
 
 The compiler is **not** required to dynamically rewrite layouts based on observed access patterns. `tile_shape` is a programmer-driven hint, not an autotuner.
+
+> Ruoyu: Even if the compiler is not an autotuner, it should still recognize and preserve opportunities for hierarchical DMA reuse. If the same GM neighborhood feeds multiple subtiles, a compiler pass or PTOAS lowering should be allowed to stage a macro tile and use local transforms, rather than requiring the programmer to encode every optimization as persistent GM layout.
 
 ## 4. Impact on the pypto Compiler, PTOAS, and Simpler Runtime
 
@@ -162,6 +195,8 @@ The pypto IR's GM tensor structure must carry an additional optional field:
 | `tile_shape` | tuple of int/Expr or `None` | Physical tile shape; `None` ⇒ row-major default. |
 
 The field must be **preserved** through every IR pass and **propagated** to the back end so that PTOAS can see it.
+
+> Ruoyu: The metadata should probably be a more explicit layout descriptor, not only `tile_shape`. At minimum it should distinguish `layout = row_major` from `layout = tile_contiguous(tile_shape=...)`. If hierarchical staging is part of the design, there may also be execution-local metadata such as macro tile shape, local layout, or transform plan. These should not be conflated with persistent GM byte layout.
 
 #### Validation
 
@@ -184,13 +219,29 @@ Operations that re-interpret or reshape a tensor's logical structure can silentl
 
 Default behavior on warning: produce the result tensor with `tile_shape = None` (row-major) so that subsequent codegen is correct, even if no longer optimal. The warning message must clearly identify the source location and suggest either dropping `tile_shape`, aligning the slice, or rematerializing with a fresh `tile_shape`.
 
+> Ruoyu: Falling back to `tile_shape = None` on views may hide a physical-layout mismatch. If the underlying bytes remain tile-contiguous, simply marking a view as row-major is not correct unless a real copy/rematerialization occurs. The compiler needs a clear distinction between "view with non-trivial physical layout" and "new row-major materialized tensor."
+
 #### Codegen
 
 When generating `TLOAD` / `TSTORE` for a tensor with non-default `tile_shape`, the compiler computes the GM offset of the requested tile from the **tile-grid coordinates**, not the default row-major offset formula. This information is forwarded to PTOAS via the tensor's metadata.
 
+> Ruoyu: Codegen should also say how local layout transforms are selected. A GM offset formula is not enough: PTOAS must decide the DMA shape, UB destination layout, whether a `tmov`/`textract` is required after load, and whether multiple local tiles are assembled with `tinsert` before store.
+
 ### 4.2 PTOAS
 
 PTOAS is responsible for emitting the physical instruction binary for `TLOAD`, `TSTORE`, and `TASSEMBLE`. Its requirements:
+
+> Ruoyu: `TASSEMBLE` should probably not be introduced as a new required primitive. In current PTOAS terms, assembling a larger local tile from smaller pieces can be represented as multiple `tinsert` instructions. A `tinsert` writes a smaller source tile/window into a destination tile buffer at a selected offset or subregion. Therefore "TASSEMBLE" is just a higher-level pattern:
+>
+> ```text
+> dst_macro_tile = empty/local output tile
+> tinsert(subtile_0, dst_macro_tile, offset_0)
+> tinsert(subtile_1, dst_macro_tile, offset_1)
+> ...
+> TSTORE(dst_macro_tile, GM)
+> ```
+>
+> The design should remove `TASSEMBLE` or define it only as syntactic sugar/lowering shorthand for a sequence of `tinsert` operations.
 
 1. **Accept and honor the `tile_shape` metadata** for every GM tensor argument.
 2. **Be cognizant of the layout** when emitting addressing logic. For a non-default `tile_shape`, the byte address of element `(i0, i1, ...)` is:
@@ -209,7 +260,19 @@ PTOAS is responsible for emitting the physical instruction binary for `TLOAD`, `
 3. **Generate physical instructions whose access pattern matches the layout.** When the `TLOAD` / `TSTORE` access shape equals `tile_shape` and is tile-aligned, PTOAS shall emit a single contiguous-burst instruction. When it does not match, PTOAS may emit either a strided sequence (correct but slow) or refuse and report an error, per the platform-specific code generator's policy.
 4. **`TASSEMBLE`** (which composes a tensor in SRAM from multiple sub-tile transfers) must use the same layout-aware addressing so that the in-SRAM image is reconstructed correctly regardless of GM layout.
 
+> Ruoyu: Requirement (3) is underspecified for existing hierarchical DMA. PTOAS already has a multi-level DMA model and local tile transforms. The lowering policy should include:
+>
+> - direct matched tile load/store from persistent tile-contiguous GM;
+> - row-major GM macro-tile load into UB followed by `textract` into compute tiles;
+> - local `tmov` between tile domains/layouts where the next layer expects a different tile layout;
+> - local `tinsert` assembly before one larger `TSTORE`;
+> - explicit cost/legality rules for when to choose each path.
+>
+> Requirement (4) should be replaced by a `tinsert`-based assembly rule. The layout-aware addressing belongs to the GM-facing load/store and macro-tile selection; once data is in local buffers, `textract`, `tmov`, and `tinsert` should describe the layer-by-layer layout transforms.
+
 PTOAS is the lowest level that has to *act* on `tile_shape`. The pypto compiler decides the layout; PTOAS executes it.
+
+> Ruoyu: PTOAS should not only "execute" a layout chosen by pypto. It also owns low-level choices about DMA loop shape, local buffer layout, and transform sequence. The proposal should give PTOAS enough freedom to use hierarchical DMA and local transforms even when persistent GM layout is row-major.
 
 ### 4.3 Simpler Runtime
 
@@ -221,7 +284,11 @@ The simpler distributed runtime is responsible for tensor lifetime tracking, dep
 
 At the time of this writing there is no other runtime use of `tile_shape`. Should a future pass need it (e.g., layout-aware scheduling, peer-to-peer transfer chunking), the field is already plumbed through.
 
+> Ruoyu: Runtime cannot always treat `tile_shape` as opaque. For internal tensors this may be acceptable, but for host-visible tensors, distributed transfers, debug dumps, checkpointing, and ABI boundaries, the runtime must know whether bytes are row-major or tile-contiguous. Otherwise external producers/consumers may interpret the same GM allocation differently.
+
 ## Summary
+
+> Ruoyu: Summary should be softened. `tile_shape` can improve matching tile accesses, but the full design should combine persistent GM layout with hierarchical DMA staging and local layout transforms. In particular, macro-tile `TLOAD` plus `textract`/`tmov`/`tinsert` may be the better path when multiple subtiles are reused from the same GM region.
 
 | Component        | Action required                                                                                        |
 |------------------|--------------------------------------------------------------------------------------------------------|
