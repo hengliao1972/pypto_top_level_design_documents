@@ -17,13 +17,52 @@ Inherits:
 
 `sharded_tensor` is **not** a replacement for local GM tensors. It is an additional type for programs that are compiled and executed in a **multi-rank, symmetric shared-memory** environment.
 
-## Why this is experimental: applicability uncertainty
+## Design philosophy: sharded memory as pypto's cross-node programming paradigm
 
-At the time of writing, the author is **not certain** that `sharded_tensor` is materially useful for **mainstream AI training and serving systems** — the kinds of workloads exemplified by Megatron-LM-style training and vLLM / SGLang-style decode / prefill serving. The remainder of this section explains why this uncertainty exists, so that the design review can either point at a concrete workload that justifies the feature or, equivalently, scope it down or defer it.
+`sharded_tensor` plays **two** complementary roles in pypto:
 
-### The dominant cross-rank pattern in AI today is collective communication, not direct remote access
+- A **programming paradigm for cross-node data placement** — declaring, in one place, how a logically global tensor is distributed across the participating ranks, with `shape`, `tile_shape`, and `rank_shape` carrying the partitioning through the type system. One declaration replaces the conventional pattern of every rank manually allocating its own slice and hand-agreeing on offsets, strides, and synchronization points.
+- A **memory management mechanism** — collective allocation in the scope ring buffer (§6.1), an `open_share_memory` join with the all-to-all global barrier at construction (§6.2), lifetime tracking, and (default) collective retirement (§6.3). Bugs of the form *"rank 3 freed early while rank 5 was still reading"* become **type-level** errors rather than runtime races.
 
-The common parallelization schemes used in AI model training and serving — **DP** (data parallel), **TP** (tensor parallel), **PP** (pipeline parallel), **EP** (expert parallel for MoE), and **SP** (sequence parallel) — express cross-rank data movement as **explicit collective communication operations**, **not** as direct remote memory load / store or `TLOAD` / `TSTORE` against another rank's bytes:
+Building on these two roles, **the direction this design recommends** is:
+
+> **Use the memory management mechanism of `sharded_tensor` as the surface API for cross-node collective communication, instead of the traditional buffer-and-parameter style of NCCL-equivalent calls.**
+
+Concretely, an `all_reduce` collective is **defined on top of `sharded_tensor`** and takes the **whole `sharded_tensor` as its argument**, rather than threading raw buffers, element counts, dtypes, communicator groups, and streams through every call site:
+
+```python
+# Sketch (illustrative; final API names are TBD)
+ST.all_reduce(op=pl.ReduceOp.SUM)            # collective expressed against the typed object
+ST.all_gather(target=YT)                     # YT is itself a sharded_tensor with the gathered partitioning
+ST.reduce_scatter(op=pl.ReduceOp.SUM)
+ST.all_to_all(target=YT)
+ST.send(rank_id=k);  ST.recv(rank_id=k)      # PP-style point-to-point
+```
+
+The reader of `ST.all_reduce(op=pl.ReduceOp.SUM)` sees, **from the type alone**, what is being reduced, across whom (the world over which `ST` is sharded), and with what partitioning. Threading per-rank buffers, counts, communicator handles, and streams through every call site is replaced by a **single typed argument**. This materially improves the **clarity of program semantics** at every cross-node call site.
+
+### The surface API and the implementation are independent concerns
+
+The recommendation above is about the **shape of the surface API**, not about how the collective is **implemented** on the wire. The collective library underneath remains free to use **any** transport — ring or tree algorithms, hardware-collective engines, RDMA-style send / recv, or the direct-access path of §5.3 / §5.3.1 — whichever is fastest on the target platform. The typed surface and the high-performance implementation are independent concerns; one does not bind the other.
+
+| Concern | Provided by |
+|---------|-------------|
+| **Definition and data-structure layer** — type, metadata (`shape` / `tile_shape` / `rank_shape`), per-rank allocation, lifetime barriers, addressing model, **typed surface for collectives** | `sharded_tensor` (this document) |
+| **Implementation layer for cross-rank operations** — collectives, P2P, fused exchange-and-reduce, …; transport, algorithm, scheduling | A collective communication library (or libraries), free to pick **any** transport per operation, including but **not limited to** the direct-access path of §5.3 / §5.3.1 |
+
+### Positioning relative to existing frameworks
+
+pypto is **not** aiming to adapt to or mirror the cross-node API of existing open-source frameworks such as **vLLM**, **SGLang**, **Megatron-LM**, or **DeepSpeed**. Those frameworks express cross-rank traffic in a buffer-and-collective-call style for historical and practical reasons (NCCL semantics, PyTorch tensor model, accumulated kernel libraries). pypto's design goal in the **hierarchical runtime** is different: a **simpler, cleaner multi-node cluster programming paradigm** in which the programmer expresses intent more freely and more clearly at the source level, while the runtime and the collective library are free to deliver high execution efficiency at the implementation layer.
+
+`sharded_tensor` is the **central piece** of that direction at the cross-node layer. The remaining uncertainty discussed in the next section is therefore about **implementation-level details** and **target-workload validation** — not about whether the direction itself is the right one for pypto.
+
+## Why this is still experimental: implementation-level open questions
+
+The strategic direction in the previous section (sharded memory as pypto's cross-node paradigm; collectives as typed methods on `sharded_tensor`) is the **working assumption** for this document. What is **still experimental** is the **implementation level**: the **exact surface API** for collectives over `sharded_tensor`, the **right concrete workload** to use as the validation target, and the **performance characteristics** of the direct-access lowering (§5.3 / §5.3.1) versus alternatives. The remainder of this section captures the relevant context — the existing cross-rank communication landscape (which pypto is **not** trying to mirror) and the candidate workloads where the direct-access path specifically pays off — so that the design review can decide on a concrete implementation plan.
+
+### The dominant cross-rank pattern in mainstream frameworks is collective communication, not direct remote access
+
+For context (not as a goal pypto is matching): the common parallelization schemes used in AI model training and serving — **DP** (data parallel), **TP** (tensor parallel), **PP** (pipeline parallel), **EP** (expert parallel for MoE), and **SP** (sequence parallel) — express cross-rank data movement as **explicit collective communication operations**, **not** as direct remote memory load / store or `TLOAD` / `TSTORE` against another rank's bytes:
 
 | Scheme | What is split | Dominant cross-rank operation | Implemented as |
 |--------|--------------|------------------------------|----------------|
@@ -35,46 +74,22 @@ The common parallelization schemes used in AI model training and serving — **D
 
 In each case the cross-rank data movement is **collective by construction**: the schedule, the staging buffers, and the bandwidth model all assume a **single fused operation across (a subset of) ranks**, executed by an optimized library implementation. The compute kernels themselves do **not** dereference remote bytes — they read from and write to **local** buffers that the collective has already populated.
 
-### What this means for `sharded_tensor`
+This pattern shapes pypto's **implementation freedom**: the typed `sharded_tensor` surface (Design philosophy section) does not preclude going through such a collective library, and on platforms / workloads where the library is the fastest path, the runtime should use it. pypto's **surface API** is deliberately different (typed methods on `sharded_tensor`, not raw buffer parameters), but its **implementation** is free to look like — or even literally call into — an existing collective library beneath the typed surface.
 
-Direct, per-element / per-tile **remote shard access** — exactly what `sharded_tensor` is designed to express — is **not** a primitive that mainline Megatron-LM training or vLLM-style decode / prefill serving currently asks for. Their cross-rank traffic is shaped to fit **collectives** specifically because (a) collectives have predictable bandwidth and overlap behavior, (b) they are implemented by hand-tuned libraries, and (c) refactoring kernels to issue irregular remote loads / stores has historically not paid off on the interconnect models that dominate the field.
+### When the direct-access path of §5.3 / §5.3.1 specifically helps
 
-This raises an honest question for the design review: **is there a workload pypto needs to support, today or in the near term, for which expressing cross-rank access as a collective is awkward or insufficient?** Plausible candidates that are **worth evaluating** but **not yet confirmed** include:
+The typed surface of `sharded_tensor` (Design philosophy section) is admissible regardless of how the collective is implemented; in particular, an implementation that uses a hand-tuned collective library is fine. The **direct-access path** of §5.3 / §5.3.1 — CPU load / store or MTE `TLOAD` / `TSTORE` through a `ubmem import`-mapped base address, with a fallback to explicit `open_share_memory` API calls — is a **separate, narrower** capability that earns its weight only on workloads where collective formulation is awkward or insufficient. Plausible candidates that are **worth evaluating** but **not yet confirmed** include:
 
 - **Irregular cross-rank lookups** that do not fit the all-to-all dispatch / combine pattern — e.g. routing schemes where the destination set is data-dependent at fine granularity.
 - **Prefix-shared KV caches** in serving, when prefix bytes are physically resident on a rank that is not the consuming rank.
 - **MoE expert-weight access** or other "fetch a small piece from a known rank" patterns where building a full all-to-all is wasteful.
 - **Custom fused kernels** that interleave compute and remote-byte access in a way that no off-the-shelf collective expresses cleanly.
 
-If one or more of these turns out to be a real, measurable pypto requirement, `sharded_tensor` is the right primitive to express it. If not, the feature should remain experimental until such a workload is identified — or be deferred.
-
-### Counterbalance: ergonomic and definitional value, independent of how collectives are implemented
-
-Having said all of the above, there is a **separate, narrower argument** for `sharded_tensor` that does **not** depend on direct cross-rank load / store or `TLOAD` / `TSTORE` ever being the fast path. From the standpoint of **ease of programming** and **clarity of program expression**, accounting for **memory allocation** and **cross-node collective operations** through a typed `sharded_tensor` may carry significant benefit, even when the wire-level traffic is still served by a hand-tuned collective communication library.
-
-**`sharded_tensor` can pay its way as a definitional / data-structure primitive**, providing:
-
-- **One-line declaration of cross-node memory.** A `sharded_tensor` lets the programmer state, in one place, "this is one logically global tensor of shape `S`, sharded into `rank_num` pieces shaped `rank_shape` per rank, allocated and lifetime-managed at this scope." Today, the same intent typically requires every rank to (a) manually allocate its own local slice, (b) hand-agree on offsets and strides, and (c) place explicit barriers around setup and teardown, often scattered through user code. The type system is the natural place to centralize that.
-- **Uniform lifetime management across ranks.** The collective construction join (§6.2) and the (default) collective retirement (§6.3) are tied to **one** declaration in the program, not to a hand-written sequence of per-rank allocations and synchronizations. Bugs of the form "rank 3 freed early while rank 5 was still reading" become **type-level** errors rather than runtime races.
-- **A typed home for cross-node collective operations.** Operations like **all-reduce**, **all-gather**, **reduce-scatter**, **all-to-all**, and pipeline **send / recv** can be expressed as **typed methods or functions on `sharded_tensor`**, with their input / output partitioning expressed naturally via `shape` and `rank_shape`. The reader sees `ST.all_reduce(...)` against a single typed object, not raw pointers and length arguments threaded through every call site.
-- **Program clarity at call sites.** A function signature `f(x: sharded_tensor)` documents — to humans and to the compiler — that `x` is a partitioned, globally addressable object whose pieces live on the world's ranks. The same intent expressed as `f(x_local: tensor, world_size: int, my_rank: int, ...)` shifts the burden onto convention and naming.
-
-**Crucially, none of the above constrains how collective operations are implemented.** A high-performance collective communication library — NCCL-equivalent software, a dedicated hardware collective engine, an RDMA-style send / recv layer, or anything else — is **free** to provide the fastest implementation for each collective, by **whatever mechanism** suits the platform (ring algorithms, tree algorithms, hardware reductions, DMA-driven exchange, …). Such a library **does not have to** use the direct remote load / store or `TLOAD` / `TSTORE` mechanisms described in §5.3 / §5.3.1.
-
-This cleanly separates two distinct concerns:
-
-| Concern | Provided by |
-|---------|-------------|
-| **Definition and data-structure layer** — type, metadata (`shape` / `tile_shape` / `rank_shape`), per-rank allocation, lifetime barriers, addressing model | `sharded_tensor` (this document) |
-| **Implementation layer for cross-rank operations** — collectives, P2P, fused exchange-and-reduce, etc. | A collective communication library (or libraries), free to pick **any** transport per operation, including but **not limited to** the direct-access path of §5.3 / §5.3.1 |
-
-Under this split, the **applicability bar** for `sharded_tensor` is **lower** than "the workload must benefit from direct remote shard access". The lower bar is: **the workload must benefit from a typed, lifetime-managed, partitioning-aware tensor abstraction**, even if its collectives are still implemented by the same hand-tuned libraries that a non-`sharded_tensor` formulation would use.
-
-The experimental status (and the gate in Open question Q8) still applies — we still want a concrete pypto workload that demonstrably benefits from the typed abstraction — but the **kind of evidence required is broader**: ergonomic and clarity wins are admissible, not just raw cross-rank-access wins.
+If one or more of these turns out to be a real, measurable pypto requirement, the direct-access path of §5.3 / §5.3.1 pays for itself in v1. If none do, that path can be **deprioritized** in v1 without invalidating the rest of `sharded_tensor`: the typed surface (Design philosophy section) remains valuable on its own, served by a conventional collective library underneath.
 
 ### Implication for the design and the implementation
 
-Because the applicability is uncertain, this document is intentionally **descriptive** of the **shape** of the feature (type system, lifecycle, access semantics, lowering, simpler-runtime support) rather than prescriptive about a rollout schedule. **Implementation work should not begin solely on the strength of this design**; a **concrete target workload** — narrow (direct cross-rank access) or broad (typed-abstraction ergonomics) — must accompany any decision to promote `sharded_tensor` from **experimental** to a supported, on-by-default feature.
+Because the implementation-level details — the exact set of typed collectives, their precise semantics on partitioning transformations, and whether the v1 implementation includes the direct-access path — are still open, this document is intentionally **descriptive** of the **shape** of the feature (type system, lifecycle, access semantics, lowering, simpler-runtime support) rather than prescriptive about a rollout schedule. **Implementation work should not begin solely on the strength of this design**; a **concrete target workload** — narrow (direct cross-rank access) or broad (typed-abstraction ergonomics) — must accompany any decision to promote `sharded_tensor` from **experimental** to a supported, on-by-default feature.
 
 ## 1. Open share memory: ranks
 
@@ -333,12 +348,17 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
    - **(C)** Local retirement permitted only for tensors statically proven to have **no remote access** after the retirement point; collective retirement otherwise.
 6. **Failure semantics** — independently of (5), what happens if any rank fails **between** construction sync and retirement? Options span "abort the whole job", "tear down the symmetric region globally", or "fence the failed rank and continue at remaining ranks (advanced; almost certainly out of scope for the experimental version)".
 7. **Sync primitive** — whether to mandate an actual **all-to-all** at construction or accept any **all-ranks barrier with publication** that the open-share-memory layer offers, as long as it provides the same readiness guarantee. The user-visible contract is the same; the implementation cost is not.
-8. **Concrete target workload (the experimental gate).** See **"Why this is experimental: applicability uncertainty"** near the top of this document. Common AI parallelism schemes (DP / TP / PP / EP / SP) express cross-rank data movement as **collective communication**, not as direct remote shard access. Before promoting `sharded_tensor` past the experimental stage, the team should identify **at least one concrete pypto workload** for which a typed, lifetime-managed `sharded_tensor` abstraction yields a measurable improvement — either:
+8. **Concrete target workload (the experimental gate).** See **"Why this is still experimental"** near the top of this document. Before promoting `sharded_tensor` past the experimental stage, the team should identify **at least one concrete pypto workload** for which a typed, lifetime-managed `sharded_tensor` abstraction yields a measurable improvement — either:
    - **(narrow case)** a workload that benefits from the **direct cross-rank access** path of §5.3 / §5.3.1, where expressing the access as a collective is awkward or insufficient; **or**
-   - **(broad case)** a workload that benefits from the **typed definitional / lifetime-management** layer of `sharded_tensor` (per the *Counterbalance* subsection), even when its collectives are still implemented by a hand-tuned library that does **not** use direct remote load / store or `TLOAD` / `TSTORE`.
+   - **(broad case)** a workload that benefits from the **typed definitional / lifetime-management** layer of `sharded_tensor` (per the *Design philosophy* section), even when its collectives are still implemented by a hand-tuned library that does **not** use direct remote load / store or `TLOAD` / `TSTORE`.
 
    Without such a workload, the recommendation is to **keep this feature experimental** (or defer it).
-9. **Should collectives be typed methods on `sharded_tensor`?** If `sharded_tensor` is admitted on the broad-case grounds in (8), the question follows: should `all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, and PP-style `send` / `recv` be exposed as **typed methods or functions** with `sharded_tensor` arguments (and well-defined input / output partitioning expressed via `shape` / `rank_shape`), or should they remain external library calls that take raw buffers? The choice determines how much of the ergonomic / clarity benefit of `sharded_tensor` the user actually sees, and how much of the implementation freedom (any transport, any algorithm) is preserved behind the typed surface.
+9. **Exact surface API for collectives on `sharded_tensor`.** The *Design philosophy* section settles the **direction** — collectives are exposed as typed methods or functions taking `sharded_tensor` arguments. What remains for the design review:
+   - **The v1 collective set.** Which of `all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all`, `broadcast`, `scatter`, `gather`, P2P `send` / `recv`, and any pypto-specific composites (e.g., fused exchange-and-reduce) ship in v1?
+   - **Method names and signatures.** `ST.all_reduce(op=...)` style methods on `sharded_tensor`, free functions taking `sharded_tensor` arguments, or both? Naming should be consistent with the rest of pypto's typed-API surface.
+   - **Typing of partitioning transformations.** When a collective changes the partitioning (e.g., `all_gather` produces a fully replicated or differently sharded result; `reduce_scatter` from a replicated input produces a sharded result), what is the **return type**? Should the result be another `sharded_tensor` with a different `rank_shape`, a normal `tensor` (when fully replicated and locally addressable), or both depending on call form?
+   - **Interaction with the construction / retirement barriers of §6.** Whether each collective is itself a synchronization point, and whether multiple collectives over the same `sharded_tensor` need any extra fencing beyond what the construction barrier already provides.
+   - **Implementation backing.** Whether v1 implements collectives over the §5.3 / §5.3.1 direct-access path, over a conventional collective library, or both with a runtime-selectable backend.
 
 ## Summary
 
@@ -354,5 +374,5 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
 | Access semantics | Extraction / layout ops (`view`, `reshape`, `slice`, …) take a **`rank_id`** argument and operate on **one rank's slice at a time**. **`rank_id` may be omitted for own-share access** — the local slice is then handled as a **normal `tensor`**. |
 | Lowering | Local case: normal tensor codegen. Remote case: in the **preferred UB embodiment**, direct CPU load/store or MTE `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address of the target rank (set up at construction time); fallback on non-UB platforms is **synchronous or asynchronous `open_share_memory` API calls**. |
 | Coexistence | Normal `tensor`s and **tile-consecutive** `tensor`s remain definable / allocatable at **every** layer of the pypto runtime hierarchy; they are local-only and cannot be shared across nodes. |
-| Applicability | **Uncertain at the wire level — possibly valuable at the type level.** Mainstream AI training (Megatron-LM-style) and serving (vLLM / SGLang-style) workloads express cross-rank traffic as **collectives** (all-reduce / all-gather / reduce-scatter / all-to-all / P2P send-recv), not as direct remote shard access. **However**, `sharded_tensor` may still earn its place as a **typed definitional primitive** for cross-node memory allocation, lifetime management, and the surface of collective operations — **independently** of how those collectives are implemented (a high-performance collective library is free to use any transport, not necessarily the direct-access path of §5.3 / §5.3.1). Promotion past experimental requires identifying a concrete target workload, narrow case (direct cross-rank access) or broad case (typed-abstraction ergonomics). See **Why this is experimental** and Open questions Q8 / Q9. |
+| Applicability | **Direction set; implementation experimental.** `sharded_tensor` is positioned as pypto's **cross-node programming paradigm** at the hierarchical-runtime layer: a typed declaration of cross-node placement plus collective memory management, *and* the **typed surface for cross-node collective communication** (e.g., `ST.all_reduce(op=...)`). pypto deliberately does **not** mirror the buffer-and-collective-call API of vLLM / SGLang / Megatron-LM / DeepSpeed; the implementation underneath, however, is free to use any transport (collective library, hardware engine, RDMA, or the direct-access path of §5.3 / §5.3.1). Promotion past experimental requires settling the v1 collective surface (Q9) and a concrete target workload — narrow case (direct cross-rank access) or broad case (typed-abstraction ergonomics). See **Design philosophy**, **Why this is still experimental**, and Open questions Q8 / Q9. |
 | **Status** | **Experimental** design; **not** a committed product feature until the pypto team approves, a concrete target workload is identified, and implementation planning completes. |
